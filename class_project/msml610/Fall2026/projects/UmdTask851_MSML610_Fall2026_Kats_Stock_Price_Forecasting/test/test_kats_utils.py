@@ -10,7 +10,7 @@ import contextlib
 import io
 import logging
 import os
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -380,6 +380,104 @@ class Test_to_business_day_series(hunitest.TestCase):
 
 
 # #############################################################################
+# Test_resample_series
+# #############################################################################
+
+
+class Test_resample_series(hunitest.TestCase):
+    """
+    Test `kats_utils.resample_series()`.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that each complete week keeps its Friday close.
+        """
+        # Prepare inputs.
+        series = _make_bday_series(list(range(10, 20)), start="2021-01-04")
+        # Prepare outputs.
+        expected = """
+                    Close
+        2021-01-08     14
+        2021-01-15     19
+        """
+        # Run test.
+        actual = utils.resample_series(series, utils.WEEKLY)
+        # Check outputs.
+        self.assert_equal(actual.to_frame().to_string(), expected, dedent=True)
+
+    def test2(self) -> None:
+        """
+        Test that an incomplete last week is dropped.
+        """
+        # Prepare inputs.
+        # The data stops on Wednesday 2021-01-13.
+        series = _make_bday_series(list(range(10, 18)), start="2021-01-04")
+        # Prepare outputs.
+        expected = """
+                    Close
+        2021-01-08     14
+        """
+        # Run test.
+        actual = utils.resample_series(series, utils.WEEKLY)
+        # Check outputs.
+        self.assert_equal(actual.to_frame().to_string(), expected, dedent=True)
+
+    def test3(self) -> None:
+        """
+        Test that a month keeps its last close and the open month is dropped.
+        """
+        # Prepare inputs.
+        index = pd.bdate_range("2021-01-25", "2021-03-10")
+        series = pd.Series(np.arange(len(index), dtype=float), index=index)
+        # Prepare outputs.
+        expected = "['2021-01-31', '2021-02-28']"
+        # Run test.
+        actual = utils.resample_series(series, utils.MONTHLY)
+        # Check outputs.
+        self.assert_equal(str([str(d.date()) for d in actual.index]), expected)
+        # The last close of January is the Friday 2021-01-29.
+        self.assertEqual(actual.iloc[0], series.loc["2021-01-29"])
+
+
+# #############################################################################
+# Test_list_price_files
+# #############################################################################
+
+
+class Test_list_price_files(hunitest.TestCase):
+    """
+    Test `kats_utils.list_price_files()`.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the tickers come from the file names, sorted.
+        """
+        # Prepare inputs.
+        data_dir = self.get_scratch_space()
+        for name in ["TSLA.csv", "aapl.csv", "notes.txt"]:
+            hio.to_file(os.path.join(data_dir, name), "Date,Close\n")
+        # Prepare outputs.
+        expected = "['AAPL', 'TSLA']"
+        # Run test.
+        actual = utils.list_price_files(data_dir)
+        # Check outputs.
+        self.assert_equal(str(list(actual.keys())), expected)
+        self.assertEqual(actual["TSLA"], os.path.join(data_dir, "TSLA.csv"))
+
+    def test2(self) -> None:
+        """
+        Test that a missing directory is rejected.
+        """
+        # Prepare inputs.
+        data_dir = os.path.join(self.get_scratch_space(), "missing")
+        # Run test and check outputs.
+        with self.assertRaises(AssertionError):
+            utils.list_price_files(data_dir)
+
+
+# #############################################################################
 # Test_to_timeseries_data
 # #############################################################################
 
@@ -721,6 +819,23 @@ class Test_forecast_naive(hunitest.TestCase):
         # Run test and check outputs.
         self.helper(values, start, horizon, expected)
 
+    def test5(self) -> None:
+        """
+        Test that a weekly series is forecast on the next Fridays.
+        """
+        # Prepare inputs.
+        train = pd.Series(
+            [100.0, 102.0, 101.0],
+            index=pd.date_range("2021-01-01", periods=3, freq=utils.WEEKLY),
+        )
+        # Prepare outputs.
+        expected = "['2021-01-22', '2021-01-29']"
+        # Run test.
+        forecast = utils.forecast_naive(train, 2, freq=utils.WEEKLY)
+        # Check outputs.
+        actual = str([str(t.date()) for t in forecast["time"]])
+        self.assert_equal(actual, expected)
+
 
 # #############################################################################
 # Test_select_arima_order
@@ -929,6 +1044,48 @@ class Test_forecast_all(hunitest.TestCase):
         same_dates = all(t == times[0] for t in times)
         actual = "%s %s" % (list(forecasts.keys()), same_dates)
         self.assert_equal(actual, expected)
+
+    @pytest.mark.slow
+    def test2(self) -> None:
+        """
+        Test that the log-scale forecasts are in prices, not in logs.
+
+        The naive forecast is the last price whatever the scale.
+        """
+        # Prepare inputs.
+        train = utils.make_synthetic_series(num_periods=100, freq="B")
+        horizon = 5
+        order = (1, 1, 0)
+        # Run test.
+        forecasts = utils.forecast_all(
+            train, horizon, arima_order=order, log_scale=True
+        )
+        # Check outputs.
+        naive = forecasts[utils.NAIVE]
+        np.testing.assert_allclose(naive["fcst"], train.iloc[-1])
+        for forecast in forecasts.values():
+            self.assertTrue((forecast["fcst"] > 10).all())
+
+    @pytest.mark.slow
+    def test3(self) -> None:
+        """
+        Test that a weekly grid gives weekly forecast dates for all models.
+        """
+        # Prepare inputs.
+        train = utils.make_synthetic_series(num_periods=80, freq=utils.WEEKLY)
+        horizon = 3
+        order = (1, 1, 0)
+        # Prepare outputs.
+        expected = pd.date_range(train.index[-1], periods=4, freq=utils.WEEKLY)[
+            1:
+        ]
+        # Run test.
+        forecasts = utils.forecast_all(
+            train, horizon, arima_order=order, freq=utils.WEEKLY
+        )
+        # Check outputs.
+        for forecast in forecasts.values():
+            self.assertEqual(list(forecast["time"]), list(expected))
 
 
 # #############################################################################
@@ -1310,6 +1467,139 @@ class Test_summarize_rolling_evaluation(hunitest.TestCase):
         self.assert_equal(
             actual.round(4).to_string(), expected, dedent=True, fuzzy_match=True
         )
+
+
+# #############################################################################
+# Test_forecast_mlar
+# #############################################################################
+
+
+class Test_forecast_mlar(hunitest.TestCase):
+    """
+    Test `kats_utils.forecast_mlar()`.
+    """
+
+    def helper(self, covariate: Optional[str]) -> pd.DataFrame:
+        """
+        Forecast 5 days of a synthetic price that comes with a volume.
+
+        :param covariate: covariate column to use, if any
+        :return: the forecast
+        """
+        # Prepare inputs.
+        close = utils.make_synthetic_series(num_periods=120, freq="B")
+        rng = np.random.default_rng(1)
+        volume = pd.Series(rng.normal(15, 1, len(close)), index=close.index)
+        frame = pd.DataFrame({"Close": close, "log_volume": volume})
+        # Run test.
+        return utils.forecast_mlar(
+            frame, 5, covariate=covariate, input_window=10, covariate_window=5
+        )
+
+    @pytest.mark.slow
+    def test1(self) -> None:
+        """
+        Test the dates and the columns of a forecast without a covariate.
+        """
+        # Run test.
+        actual = self.helper(None)
+        # Prepare outputs.
+        expected_start = pd.bdate_range("2020-01-01", periods=121)[-1]
+        # Check outputs.
+        self.assertEqual(list(actual.columns), ["time", "fcst"])
+        self.assertEqual(len(actual), 5)
+        self.assertEqual(actual["time"].iloc[0], expected_start)
+        self.assertFalse(actual["fcst"].isna().any())
+
+    @pytest.mark.slow
+    def test2(self) -> None:
+        """
+        Test that a covariate changes the forecast but not its shape.
+        """
+        # Run test.
+        without = self.helper(None)
+        with_covariate = self.helper("log_volume")
+        # Check outputs.
+        self.assertEqual(list(with_covariate.columns), ["time", "fcst"])
+        self.assertEqual(list(with_covariate["time"]), list(without["time"]))
+        self.assertFalse(np.allclose(without["fcst"], with_covariate["fcst"]))
+
+
+# #############################################################################
+# Test_rolling_origin_mlar
+# #############################################################################
+
+
+class Test_rolling_origin_mlar(hunitest.TestCase):
+    """
+    Test `kats_utils.rolling_origin_mlar()`.
+    """
+
+    @pytest.mark.slow
+    def test1(self) -> None:
+        """
+        Test that both variants are scored at the origins of the other models.
+        """
+        # Prepare inputs.
+        close = utils.make_synthetic_series(num_periods=150, freq="B")
+        rng = np.random.default_rng(1)
+        volume = pd.Series(rng.normal(15, 1, len(close)), index=close.index)
+        frame = pd.DataFrame({"Close": close, "log_volume": volume})
+        horizon = 10
+        # Run test.
+        actual = utils.rolling_origin_mlar(
+            frame,
+            horizon,
+            num_origins=2,
+            covariate="log_volume",
+            input_window=10,
+            covariate_window=5,
+        )
+        # Prepare outputs.
+        expected_origins = [close.index[129], close.index[139]]
+        # Check outputs.
+        self.assertEqual(sorted(actual["origin"].unique()), expected_origins)
+        self.assert_equal(
+            str(sorted(actual["model"].unique())),
+            "['MLAR', 'MLAR + log_volume']",
+        )
+        self.assertEqual(len(actual), 4)
+
+
+# #############################################################################
+# Test_backtest_prices
+# #############################################################################
+
+
+class Test_backtest_prices(hunitest.TestCase):
+    """
+    Test `kats_utils.backtest_prices()`.
+    """
+
+    @pytest.mark.slow
+    def test1(self) -> None:
+        """
+        Test that the summary has one row per model and a unit naive ratio.
+        """
+        # Prepare inputs.
+        series = utils.make_synthetic_series(num_periods=150, freq="B")
+        # Run test.
+        actual = utils.backtest_prices(series, horizon=10, num_origins=2)
+        # Check outputs.
+        self.assert_equal(
+            str(list(actual.index)), "['Naive', 'ARIMA', 'Prophet']"
+        )
+        self.assertAlmostEqual(actual.loc["Naive", "mean MAE / naive MAE"], 1.0)
+
+    def test2(self) -> None:
+        """
+        Test that the windows must leave data to pick the ARIMA order.
+        """
+        # Prepare inputs.
+        series = utils.make_synthetic_series(num_periods=30, freq="B")
+        # Run test and check outputs.
+        with self.assertRaises(AssertionError):
+            utils.backtest_prices(series, horizon=10, num_origins=3)
 
 
 # #############################################################################

@@ -18,9 +18,10 @@ import json
 import logging
 import os
 import warnings
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
+import matplotlib.ticker
 import numpy as np
 import pandas as pd
 import scipy.stats
@@ -28,6 +29,7 @@ import statsmodels.tsa.stattools as stattools
 import tqdm
 from kats.consts import TimeSeriesData
 from kats.models.arima import ARIMAModel, ARIMAParams
+from kats.models.ml_ar import MLARModel, MLARParams
 from kats.models.prophet import ProphetModel, ProphetParams
 
 import helpers.hdbg as hdbg
@@ -65,8 +67,11 @@ def init_loggers(notebook_log: logging.Logger) -> None:
 TIME_COL = "time"
 VALUE_COL = "value"
 
-# Pandas frequency alias for business days (Monday to Friday).
+# Pandas frequency aliases: business days (Monday to Friday), weeks ending on
+# Friday, and calendar months.
 BUSINESS_DAY = "B"
+WEEKLY = "W-FRI"
+MONTHLY = "M"
 
 # Names of the models, used as keys in dictionaries and tables.
 NAIVE = "Naive"
@@ -219,6 +224,52 @@ def to_business_day_series(
     return series
 
 
+def resample_series(series: pd.Series, freq: str) -> pd.Series:
+    """
+    Aggregate a business-day price series to a coarser interval.
+
+    Each period keeps its last price, which is the closing price of the week or
+    the month. The last period is dropped when the data stops before it ends,
+    since its last value is not the closing price of that period.
+
+    :param series: prices indexed by business day
+    :param freq: pandas alias of the interval, e.g., `WEEKLY` or `MONTHLY`
+    :return: series indexed by the end of each complete period
+    """
+    _LOG.debug(hprint.to_str("freq"))
+    out = series.resample(freq).last()
+    # The label of a period is its end, so a label after the last observation
+    # means the period is incomplete.
+    if out.index[-1] > series.index[-1]:
+        out = out.iloc[:-1]
+    _LOG.info(
+        "Resampled '%d' points to '%d' points of '%s'",
+        len(series),
+        len(out),
+        freq,
+    )
+    return out
+
+
+def list_price_files(data_dir: str) -> Dict[str, str]:
+    """
+    Find the price files in a directory, one per ticker.
+
+    The ticker is the name of the file without the extension, so `TSLA.csv`
+    holds the prices of `TSLA`. To add a stock, drop its CSV in the directory.
+
+    :param data_dir: directory with files in the format of `load_prices()`
+    :return: path of each file, keyed by ticker and sorted by ticker
+    """
+    hdbg.dassert_dir_exists(data_dir)
+    files = [f for f in os.listdir(data_dir) if f.endswith(".csv")]
+    paths = {
+        os.path.splitext(f)[0].upper(): os.path.join(data_dir, f) for f in files
+    }
+    # Sort by ticker, since the sort order of the file names depends on case.
+    return dict(sorted(paths.items()))
+
+
 def to_timeseries_data(series: pd.Series) -> TimeSeriesData:
     """
     Convert a pandas series with a datetime index into `TimeSeriesData`.
@@ -344,37 +395,43 @@ def quiet_model_logs() -> Iterator[None]:
             logging.getLogger(name).setLevel(level)
 
 
-def _forecast_index(train: pd.Series, horizon: int) -> pd.DatetimeIndex:
+def _forecast_index(
+    train: pd.Series, horizon: int, *, freq: str = BUSINESS_DAY
+) -> pd.DatetimeIndex:
     """
-    Return the next `horizon` business days after the end of the training set.
+    Return the next `horizon` periods after the end of the training set.
 
-    :param train: training series on a business-day grid
-    :param horizon: number of days to forecast
+    :param train: training series on a regular grid
+    :param horizon: number of periods to forecast
+    :param freq: pandas alias of the grid
     :return: dates of the forecast
     """
-    index = pd.date_range(
-        train.index[-1], periods=horizon + 1, freq=BUSINESS_DAY
-    )
+    index = pd.date_range(train.index[-1], periods=horizon + 1, freq=freq)
     # Drop the first date, which is the last training day.
     return index[1:]
 
 
 def forecast_naive(
-    train: pd.Series, horizon: int, *, interval_level: float = 0.95
+    train: pd.Series,
+    horizon: int,
+    *,
+    interval_level: float = 0.95,
+    freq: str = BUSINESS_DAY,
 ) -> pd.DataFrame:
     """
     Forecast with the last observed value, i.e., a random walk without drift.
 
     Stock prices are close to a random walk, so this is the bar that any model
     has to clear. The interval widens as `sigma * sqrt(h)`, where `sigma` is the
-    standard deviation of the daily changes in the training set.
+    standard deviation of the changes between two points of the training set.
 
-    :param train: training series on a business-day grid
-    :param horizon: number of days to forecast
+    :param train: training series on a regular grid
+    :param horizon: number of periods to forecast
     :param interval_level: probability mass of the prediction interval
+    :param freq: pandas alias of the grid
     :return: frame with columns `time, fcst, fcst_lower, fcst_upper`
     """
-    _LOG.debug(hprint.to_str("horizon interval_level"))
+    _LOG.debug(hprint.to_str("horizon interval_level freq"))
     last_value = train.iloc[-1]
     sigma = train.diff().std()
     steps = np.arange(1, horizon + 1)
@@ -382,7 +439,7 @@ def forecast_naive(
     half_width = z * sigma * np.sqrt(steps)
     return pd.DataFrame(
         {
-            TIME_COL: _forecast_index(train, horizon),
+            TIME_COL: _forecast_index(train, horizon, freq=freq),
             "fcst": last_value,
             "fcst_lower": last_value - half_width,
             "fcst_upper": last_value + half_width,
@@ -430,27 +487,29 @@ def forecast_arima(
     *,
     order: Tuple[int, int, int],
     interval_level: float = 0.95,
+    freq: str = BUSINESS_DAY,
 ) -> pd.DataFrame:
     """
-    Fit a Kats `ARIMAModel` and forecast the next `horizon` business days.
+    Fit a Kats `ARIMAModel` and forecast the next `horizon` periods.
 
     The point forecast comes from Kats. The prediction interval is recomputed
     from the fitted statsmodels results because Kats ignores its `alpha`
     argument and always returns a 95% interval.
 
-    :param train: training series on a business-day grid
-    :param horizon: number of days to forecast
+    :param train: training series on a regular grid
+    :param horizon: number of periods to forecast
     :param order: ARIMA order `(p, d, q)`
     :param interval_level: probability mass of the prediction interval
+    :param freq: pandas alias of the grid
     :return: frame with columns `time, fcst, fcst_lower, fcst_upper`
     """
-    _LOG.debug(hprint.to_str("horizon order interval_level"))
+    _LOG.debug(hprint.to_str("horizon order interval_level freq"))
     p, d, q = order
     ts = to_timeseries_data(train)
     with quiet_model_logs():
         model = ARIMAModel(ts, ARIMAParams(p=p, d=d, q=q))
         model.fit()
-        forecast = model.predict(steps=horizon, freq=BUSINESS_DAY)
+        forecast = model.predict(steps=horizon, freq=freq)
     # `ARIMAModel.predict()` accepts `alpha` but never uses it: the interval it
     # returns is always 95%. Rebuild the bounds from the fitted statsmodels
     # results (`model.model`) so that `interval_level` is respected.
@@ -459,7 +518,7 @@ def forecast_arima(
     )
     forecast["fcst_lower"] = bounds["mean_ci_lower"].to_numpy()
     forecast["fcst_upper"] = bounds["mean_ci_upper"].to_numpy()
-    return _check_forecast(forecast, train, horizon)
+    return _check_forecast(forecast, train, horizon, freq=freq)
 
 
 def forecast_prophet(
@@ -469,23 +528,26 @@ def forecast_prophet(
     interval_level: float = 0.95,
     yearly_seasonality: bool = True,
     weekly_seasonality: bool = True,
+    freq: str = BUSINESS_DAY,
 ) -> pd.DataFrame:
     """
-    Fit a Kats `ProphetModel` and forecast the next `horizon` business days.
+    Fit a Kats `ProphetModel` and forecast the next `horizon` periods.
 
     Prophet defaults to an 80% interval and ARIMA to 95%, so the level is set
     explicitly to make the two intervals comparable.
 
-    :param train: training series on a business-day grid
-    :param horizon: number of days to forecast
+    :param train: training series on a regular grid
+    :param horizon: number of periods to forecast
     :param interval_level: probability mass of the prediction interval
     :param yearly_seasonality: fit a yearly seasonal component
-    :param weekly_seasonality: fit a weekly seasonal component
+    :param weekly_seasonality: fit a weekly seasonal component, which needs
+        daily data
+    :param freq: pandas alias of the grid
     :return: frame with columns `time, fcst, fcst_lower, fcst_upper`
     """
     _LOG.debug(
         hprint.to_str(
-            "horizon interval_level yearly_seasonality weekly_seasonality"
+            "horizon interval_level yearly_seasonality weekly_seasonality freq"
         )
     )
     ts = to_timeseries_data(train)
@@ -497,28 +559,46 @@ def forecast_prophet(
     with quiet_model_logs():
         model = ProphetModel(ts, params)
         model.fit()
-        forecast = model.predict(steps=horizon, freq=BUSINESS_DAY)
-    return _check_forecast(forecast, train, horizon)
+        forecast = model.predict(steps=horizon, freq=freq)
+    return _check_forecast(forecast, train, horizon, freq=freq)
 
 
 def _check_forecast(
-    forecast: pd.DataFrame, train: pd.Series, horizon: int
+    forecast: pd.DataFrame,
+    train: pd.Series,
+    horizon: int,
+    *,
+    freq: str = BUSINESS_DAY,
 ) -> pd.DataFrame:
     """
     Check that a Kats forecast covers the expected days and has the right shape.
 
     :param forecast: output of a Kats `predict()` call
     :param train: training series the model was fitted on
-    :param horizon: number of days that were requested
+    :param horizon: number of periods that were requested
+    :param freq: pandas alias of the grid
     :return: the forecast with the standard columns
     """
     hdbg.dassert_eq(len(forecast), horizon, "Forecast has the wrong length")
-    expected = _forecast_index(train, horizon)
+    expected = _forecast_index(train, horizon, freq=freq)
     hdbg.dassert(
         (forecast[TIME_COL].values == expected.values).all(),
-        "Forecast dates must follow the training set on the business-day grid",
+        "Forecast dates must follow the training set on the grid",
     )
     return forecast[_FORECAST_COLS].reset_index(drop=True)
+
+
+def _exp_forecast(forecast: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert a forecast of log prices back to prices.
+
+    :param forecast: frame with columns `time, fcst, fcst_lower, fcst_upper`
+    :return: the same frame with the forecast columns exponentiated
+    """
+    out = forecast.copy()
+    for col in ["fcst", "fcst_lower", "fcst_upper"]:
+        out[col] = np.exp(out[col])
+    return out
 
 
 def forecast_all(
@@ -527,23 +607,104 @@ def forecast_all(
     *,
     arima_order: Tuple[int, int, int],
     interval_level: float = 0.95,
+    freq: str = BUSINESS_DAY,
+    log_scale: bool = False,
 ) -> Dict[str, pd.DataFrame]:
     """
     Forecast the same horizon with the naive baseline, ARIMA, and Prophet.
 
-    :param train: training series on a business-day grid
-    :param horizon: number of days to forecast
+    Prophet fits a weekly pattern only on daily data, so the weekly component
+    is switched off for any other interval.
+
+    :param train: training series on a regular grid
+    :param horizon: number of periods to forecast
     :param arima_order: ARIMA order `(p, d, q)`
     :param interval_level: probability mass of the prediction intervals
-    :return: forecast frame of each model, keyed by model name
+    :param freq: pandas alias of the grid
+    :param log_scale: fit the models on the log of the prices and convert the
+        forecasts back to prices. The price changes of a stock grow with its
+        price, which only the log removes
+    :return: forecast frame of each model, keyed by model name, in prices
     """
-    return {
-        NAIVE: forecast_naive(train, horizon, interval_level=interval_level),
-        ARIMA: forecast_arima(
-            train, horizon, order=arima_order, interval_level=interval_level
+    hdbg.dassert((train > 0).all() or not log_scale, "Log needs positive prices")
+    data = np.log(train) if log_scale else train
+    forecasts = {
+        NAIVE: forecast_naive(
+            data, horizon, interval_level=interval_level, freq=freq
         ),
-        PROPHET: forecast_prophet(train, horizon, interval_level=interval_level),
+        ARIMA: forecast_arima(
+            data,
+            horizon,
+            order=arima_order,
+            interval_level=interval_level,
+            freq=freq,
+        ),
+        PROPHET: forecast_prophet(
+            data,
+            horizon,
+            interval_level=interval_level,
+            weekly_seasonality=freq == BUSINESS_DAY,
+            freq=freq,
+        ),
     }
+    if log_scale:
+        forecasts = {name: _exp_forecast(f) for name, f in forecasts.items()}
+    return forecasts
+
+
+def forecast_mlar(
+    frame: pd.DataFrame,
+    horizon: int,
+    *,
+    target: str = "Close",
+    covariate: Optional[str] = None,
+    input_window: int = 20,
+    covariate_window: int = 10,
+    freq: str = BUSINESS_DAY,
+) -> pd.DataFrame:
+    """
+    Train a Kats `MLARModel` and forecast the next `horizon` periods.
+
+    `MLARModel` is a LightGBM regressor over lagged values. Besides the lags of
+    the target, it can read the lags of a covariate, such as the trading
+    volume. The covariate is only read up to the end of the training set.
+
+    :param frame: training data indexed by time, with the target column and the
+        covariate column
+    :param horizon: number of periods to forecast
+    :param target: column to forecast
+    :param covariate: column whose past values are used as features, if any
+    :param input_window: number of lags of the target
+    :param covariate_window: number of lags of the covariate
+    :param freq: pandas alias of the grid
+    :return: frame with columns `time, fcst`, with no interval since MLAR does
+        not give one
+    """
+    _LOG.debug(hprint.to_str("horizon target covariate input_window freq"))
+    columns = [target] if covariate is None else [target, covariate]
+    ts = TimeSeriesData(frame[columns].rename_axis(TIME_COL).reset_index())
+    kwargs = {}
+    if covariate is not None:
+        kwargs["cov_history_input_windows"] = {covariate: covariate_window}
+    params = MLARParams(
+        target_variable=target,
+        horizon=horizon,
+        input_window=input_window,
+        freq=freq,
+        **kwargs,
+    )
+    model = MLARModel(params)
+    with quiet_model_logs():
+        model.train([ts])
+        output = model.predict()
+    forecast = output[0].rename(columns={"forecast": "fcst"})
+    forecast = forecast[[TIME_COL, "fcst"]].reset_index(drop=True)
+    expected = _forecast_index(frame[target], horizon, freq=freq)
+    hdbg.dassert(
+        (forecast[TIME_COL].values == expected.values).all(),
+        "Forecast dates must follow the training set on the grid",
+    )
+    return forecast
 
 
 # #############################################################################
@@ -630,6 +791,8 @@ def rolling_origin_evaluation(
     num_origins: int,
     arima_order: Tuple[int, int, int],
     interval_level: float = 0.95,
+    freq: str = BUSINESS_DAY,
+    log_scale: bool = False,
 ) -> pd.DataFrame:
     """
     Backtest the models on consecutive test windows, refitting at each origin.
@@ -639,11 +802,13 @@ def rolling_origin_evaluation(
     `num_origins` non-overlapping windows of `horizon` days shows which result
     holds up. At each origin the models see only the data before it.
 
-    :param series: values indexed by timestamp, on a business-day grid
-    :param horizon: number of days in each test window
+    :param series: values indexed by timestamp, on a regular grid
+    :param horizon: number of periods in each test window
     :param num_origins: number of windows, ending at the end of the series
     :param arima_order: ARIMA order `(p, d, q)`, kept fixed across origins
     :param interval_level: probability mass of the prediction intervals
+    :param freq: pandas alias of the grid
+    :param log_scale: fit the models on log prices, see `forecast_all()`
     :return: one row per origin and model, with the origin, the price change
         over the window, MAE, RMSE, the MAE ratio to the naive baseline, and
         the interval coverage
@@ -664,6 +829,8 @@ def rolling_origin_evaluation(
             horizon,
             arima_order=arima_order,
             interval_level=interval_level,
+            freq=freq,
+            log_scale=log_scale,
         )
         metrics = evaluate_forecasts(test, forecasts)
         change_pct = 100 * (test.iloc[-1] / train.iloc[-1] - 1)
@@ -708,6 +875,105 @@ def summarize_rolling_evaluation(results: pd.DataFrame) -> pd.DataFrame:
     summary.loc[NAIVE, "windows beating naive (%)"] = np.nan
     summary.loc[ARIMA, "windows beating ARIMA (%)"] = np.nan
     return summary.loc[[NAIVE, ARIMA, PROPHET]]
+
+
+def rolling_origin_mlar(
+    frame: pd.DataFrame,
+    horizon: int,
+    *,
+    num_origins: int,
+    covariate: str,
+    target: str = "Close",
+    input_window: int = 20,
+    covariate_window: int = 10,
+    freq: str = BUSINESS_DAY,
+) -> pd.DataFrame:
+    """
+    Backtest `MLARModel` with and without a covariate on consecutive windows.
+
+    The windows are the ones of `rolling_origin_evaluation()`, so the ratios are
+    comparable with the ones of the other models.
+
+    :param frame: data indexed by time, with the target and covariate columns
+    :param horizon: number of periods in each test window
+    :param num_origins: number of windows, ending at the end of the data
+    :param covariate: column whose past values are the extra features
+    :param target: column to forecast
+    :param input_window: number of lags of the target
+    :param covariate_window: number of lags of the covariate
+    :param freq: pandas alias of the grid
+    :return: one row per origin and variant, with the origin, the variant name,
+        the MAE, and the MAE ratio to the naive baseline
+    """
+    _LOG.debug(hprint.to_str("horizon num_origins covariate target"))
+    hdbg.dassert_lt(0, num_origins, "Need at least one origin")
+    first_test = [len(frame) - horizon * k for k in range(num_origins, 0, -1)]
+    hdbg.dassert_lt(
+        0, first_test[0], "Data is too short for '%d' windows", num_origins
+    )
+    variants = {"MLAR": None, f"MLAR + {covariate}": covariate}
+    rows: List[Dict[str, object]] = []
+    for start in tqdm.tqdm(first_test, desc="Origins"):
+        train = frame.iloc[:start]
+        test = frame[target].iloc[start : start + horizon]
+        naive = forecast_naive(train[target], horizon, freq=freq)
+        naive_mae = compute_mae(test.values, naive["fcst"].values)
+        for name, cov in variants.items():
+            forecast = forecast_mlar(
+                train,
+                horizon,
+                target=target,
+                covariate=cov,
+                input_window=input_window,
+                covariate_window=covariate_window,
+                freq=freq,
+            )
+            mae = compute_mae(test.values, forecast["fcst"].values)
+            rows.append(
+                {
+                    "origin": train.index[-1],
+                    "model": name,
+                    "MAE": mae,
+                    "MAE / naive MAE": mae / naive_mae,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def backtest_prices(
+    series: pd.Series,
+    *,
+    horizon: int,
+    num_origins: int,
+    freq: str = BUSINESS_DAY,
+    log_scale: bool = False,
+) -> pd.DataFrame:
+    """
+    Pick the ARIMA order, run the rolling backtest, and summarize it.
+
+    The order is chosen on the data before the first test window, so the choice
+    cannot see any of the windows.
+
+    :param series: prices indexed by time, on a regular grid
+    :param horizon: number of periods in each test window
+    :param num_origins: number of windows, ending at the end of the series
+    :param freq: pandas alias of the grid
+    :param log_scale: fit the models on log prices, see `forecast_all()`
+    :return: summary with one row per model, see
+        `summarize_rolling_evaluation()`
+    """
+    held_out = horizon * num_origins
+    hdbg.dassert_lt(held_out, len(series), "No data left to pick the order")
+    order = select_arima_order(series.iloc[:-held_out])
+    results = rolling_origin_evaluation(
+        series,
+        horizon,
+        num_origins=num_origins,
+        arima_order=order,
+        freq=freq,
+        log_scale=log_scale,
+    )
+    return summarize_rolling_evaluation(results)
 
 
 # #############################################################################
@@ -802,6 +1068,10 @@ def plot_rolling_evaluation(
         )
     ax.axhline(1.0, color="black", linestyle="--", label="naive baseline")
     ax.set_yscale("log")
+    # Show plain numbers (0.6, 1, 2, 3) instead of powers of ten.
+    formatter = matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:g}")
+    ax.yaxis.set_major_formatter(formatter)
+    ax.yaxis.set_minor_formatter(formatter)
     ax.set_xlabel("forecast origin")
     ax.set_ylabel("MAE / naive MAE (log scale)")
     ax.legend()

@@ -24,6 +24,10 @@ prophet==1.1.6
 cmdstanpy==1.2.5
 holidays==0.57
 
+# `matplotlib==3.8.4` cannot draw inside a Jupyter kernel with IPython 9, which
+# removed `IPython.core.pylabtools.backend2gui`. Keep IPython below 9.
+ipython<9
+
 # Kats runtime imports (the `--no-deps` install does not pull them in).
 attrs
 deprecated

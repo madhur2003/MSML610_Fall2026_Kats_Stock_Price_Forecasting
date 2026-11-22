@@ -12,10 +12,13 @@ import kats_utils as utils
 """
 
 import contextlib
+import importlib.metadata
+import inspect
+import json
 import logging
 import os
 import warnings
-from typing import Dict, Iterator, List, Tuple
+from typing import Any, Dict, Iterator, List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -28,6 +31,7 @@ from kats.models.arima import ARIMAModel, ARIMAParams
 from kats.models.prophet import ProphetModel, ProphetParams
 
 import helpers.hdbg as hdbg
+import helpers.hintrospection as hintros
 import helpers.hnotebook as hnotebo
 import helpers.hprint as hprint
 
@@ -38,9 +42,18 @@ def init_loggers(notebook_log: logging.Logger) -> None:
     """
     Wire the notebook logger into the utils logger.
 
+    Importing Kats leaves two traces on the root logger that this function
+    cleans up: a default handler, which makes `hdbg.init_logger()` skip its own
+    setup, and an `INFO` level, under which Kats logs every step it takes.
+
     :param notebook_log: logger owned by the notebook
     """
+    root_logger = logging.getLogger()
+    for handler in list(root_logger.handlers):
+        root_logger.removeHandler(handler)
     hnotebo.init_loggers(notebook_log, utils_log=_LOG)
+    # The notebook and utils loggers print directly, so they are not affected.
+    root_logger.setLevel(logging.WARNING)
 
 
 # #############################################################################
@@ -62,6 +75,74 @@ PROPHET = "Prophet"
 
 # Columns of the forecast frame that every `forecast_*()` function returns.
 _FORECAST_COLS = [TIME_COL, "fcst", "fcst_lower", "fcst_upper"]
+
+
+# #############################################################################
+# Kats introspection
+# #############################################################################
+
+
+# Repository that holds the Kats source code.
+_KATS_REPO_URL = "https://github.com/facebookresearch/Kats"
+
+
+def get_kats_commit() -> str:
+    """
+    Return the git commit of the installed Kats.
+
+    `pip` records the commit when it installs from GitHub, as the `Dockerfile`
+    does. When the record is missing, fall back to the `main` branch.
+
+    :return: commit hash, or `main` if the install does not record one
+    """
+    commit = "main"
+    try:
+        raw = importlib.metadata.distribution("kats").read_text(
+            "direct_url.json"
+        )
+        if raw is not None:
+            commit = json.loads(raw)["vcs_info"]["commit_id"]
+    except (importlib.metadata.PackageNotFoundError, KeyError):
+        _LOG.debug("No commit recorded for the installed Kats")
+    return commit
+
+
+def get_kats_source_link(obj: Any) -> str:
+    """
+    Return the GitHub link to the definition of a Kats class or function.
+
+    The link points at the commit that is installed, so the line number matches
+    the code that runs. `hintros.get_link_to_code()` cannot be used here because
+    it needs a git checkout, while Kats is installed with `pip`.
+
+    :param obj: class or function defined in the `kats` package
+    :return: URL of the file and line where `obj` is defined
+    """
+    module = obj.__module__
+    hdbg.dassert(
+        module.startswith("kats."), "'%s' is not defined in Kats", module
+    )
+    _, line = inspect.getsourcelines(obj)
+    path = module.replace(".", "/") + ".py"
+    return f"{_KATS_REPO_URL}/blob/{get_kats_commit()}/{path}#L{line}"
+
+
+def print_kats_obj_info(obj: Any) -> None:
+    """
+    Display the public interface of a Kats class and link to its source.
+
+    Same output as `hintros.print_obj_info()`, with the link built by
+    `get_kats_source_link()`.
+
+    :param obj: class defined in the `kats` package
+    """
+    try:
+        from IPython.display import Markdown, display
+    except ImportError:
+        display = print  # type: ignore
+        Markdown = lambda x: x  # noqa: E731
+    display(Markdown(hintros.get_public_methods_as_str(obj, use_markdown=True)))
+    print(get_kats_source_link(obj))
 
 
 # #############################################################################
@@ -237,11 +318,12 @@ def make_synthetic_series(
 
 
 @contextlib.contextmanager
-def _quiet_model_logs() -> Iterator[None]:
+def quiet_model_logs() -> Iterator[None]:
     """
     Silence the convergence warnings and the Stan logs while a model fits.
 
-    Both are expected during a backtest and would bury the results.
+    Both are expected during a backtest and would bury the results. Use it as
+    `with utils.quiet_model_logs(): model.fit()`.
     """
     names = ["prophet", "cmdstanpy"]
     previous = {name: logging.getLogger(name).level for name in names}
@@ -328,7 +410,7 @@ def select_arima_order(
     ts = to_timeseries_data(train)
     best_aic = np.inf
     best_order = (0, d, 0)
-    with _quiet_model_logs():
+    with quiet_model_logs():
         for p in range(max_p + 1):
             for q in range(max_q + 1):
                 model = ARIMAModel(ts, ARIMAParams(p=p, d=d, q=q))
@@ -365,7 +447,7 @@ def forecast_arima(
     _LOG.debug(hprint.to_str("horizon order interval_level"))
     p, d, q = order
     ts = to_timeseries_data(train)
-    with _quiet_model_logs():
+    with quiet_model_logs():
         model = ARIMAModel(ts, ARIMAParams(p=p, d=d, q=q))
         model.fit()
         forecast = model.predict(steps=horizon, freq=BUSINESS_DAY)
@@ -412,7 +494,7 @@ def forecast_prophet(
         yearly_seasonality=yearly_seasonality,
         weekly_seasonality=weekly_seasonality,
     )
-    with _quiet_model_logs():
+    with quiet_model_logs():
         model = ProphetModel(ts, params)
         model.fit()
         forecast = model.predict(steps=horizon, freq=BUSINESS_DAY)
@@ -633,12 +715,35 @@ def summarize_rolling_evaluation(results: pd.DataFrame) -> pd.DataFrame:
 # #############################################################################
 
 
+def plot_series(
+    series: pd.Series,
+    *,
+    title: str = "",
+    figsize: Tuple[float, float] = (12, 3.5),
+) -> None:
+    """
+    Plot a time series as a line.
+
+    :param series: series to plot, indexed by time
+    :param title: title of the plot
+    :param figsize: size of the figure
+    """
+    _, ax = plt.subplots(figsize=figsize)
+    ax.plot(series.index, series.to_numpy(), color="tab:blue")
+    ax.set_title(title)
+    ax.set_ylabel(series.name if series.name is not None else "value")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
 def plot_forecasts(
     train: pd.Series,
     test: pd.Series,
     forecasts: Dict[str, pd.DataFrame],
     *,
     num_history: int = 120,
+    ylabel: str = "Close price ($)",
     figsize: Tuple[float, float] = (16, 4.5),
 ) -> None:
     """
@@ -651,6 +756,7 @@ def plot_forecasts(
     :param test: observed test values
     :param forecasts: forecast frame of each model, keyed by model name
     :param num_history: number of training points to show before the forecast
+    :param ylabel: label of the y axis
     :param figsize: figure size as `(width, height)`
     """
     fig, axes = plt.subplots(
@@ -669,7 +775,7 @@ def plot_forecasts(
         )
         ax.set_title(name)
         ax.tick_params(axis="x", rotation=30)
-    axes[0][0].set_ylabel("Close price ($)")
+    axes[0][0].set_ylabel(ylabel)
     # One legend below all panels, so it does not cover the intervals.
     handles, labels = axes[0][0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=len(labels))

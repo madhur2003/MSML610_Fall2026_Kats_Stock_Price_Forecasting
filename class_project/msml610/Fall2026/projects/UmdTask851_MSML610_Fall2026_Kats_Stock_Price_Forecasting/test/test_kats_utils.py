@@ -6,6 +6,8 @@ Import as:
 import class_project.msml610.Fall2026.projects.UmdTask851_MSML610_Fall2026_Kats_Stock_Price_Forecasting.test.test_kats_utils as tkatsut
 """
 
+import contextlib
+import io
 import logging
 import os
 from typing import List, Tuple
@@ -13,6 +15,7 @@ from typing import List, Tuple
 import numpy as np
 import pandas as pd
 import pytest
+from kats.models.arima import ARIMAModel
 
 import class_project.msml610.Fall2026.projects.UmdTask851_MSML610_Fall2026_Kats_Stock_Price_Forecasting.kats_utils as utils
 import helpers.hio as hio
@@ -59,6 +62,90 @@ def _make_forecast(
             "fcst_upper": upper,
         }
     )
+
+
+# #############################################################################
+# Test_get_kats_commit
+# #############################################################################
+
+
+class Test_get_kats_commit(hunitest.TestCase):
+    """
+    Test `kats_utils.get_kats_commit()`.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the install from the pinned GitHub commit is recorded.
+        """
+        # Run test.
+        actual = utils.get_kats_commit()
+        # Check outputs.
+        self.assertRegex(actual, r"^[0-9a-f]{40}$")
+
+
+# #############################################################################
+# Test_get_kats_source_link
+# #############################################################################
+
+
+class Test_get_kats_source_link(hunitest.TestCase):
+    """
+    Test `kats_utils.get_kats_source_link()`.
+    """
+
+    def test1(self) -> None:
+        """
+        Test the link to a class, pinned to the installed commit.
+        """
+        # Prepare inputs.
+        obj = ARIMAModel
+        # Prepare outputs.
+        expected = (
+            "https://github.com/facebookresearch/Kats/blob/%s/kats/models/arima.py#L89"
+            % utils.get_kats_commit()
+        )
+        # Run test.
+        actual = utils.get_kats_source_link(obj)
+        # Check outputs.
+        self.assert_equal(actual, expected)
+
+    def test2(self) -> None:
+        """
+        Test that an object from another package is rejected.
+        """
+        # Prepare inputs.
+        obj = pd.DataFrame
+        # Run test and check output.
+        with self.assertRaises(AssertionError):
+            utils.get_kats_source_link(obj)
+
+
+# #############################################################################
+# Test_print_kats_obj_info
+# #############################################################################
+
+
+class Test_print_kats_obj_info(hunitest.TestCase):
+    """
+    Test `kats_utils.print_kats_obj_info()`.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the output ends with the link to the source.
+        """
+        # Prepare inputs.
+        obj = ARIMAModel
+        # Prepare outputs.
+        expected = utils.get_kats_source_link(obj)
+        # Run test.
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            utils.print_kats_obj_info(obj)
+        # Check outputs.
+        actual = buffer.getvalue().strip().splitlines()[-1]
+        self.assert_equal(actual, expected)
 
 
 # #############################################################################
@@ -504,6 +591,35 @@ class Test_make_synthetic_series(hunitest.TestCase):
         # Check outputs.
         actual = "%s %s" % (series.index[0].date(), series.index[-1].date())
         self.assert_equal(actual, expected)
+
+
+# #############################################################################
+# Test_quiet_model_logs
+# #############################################################################
+
+
+class Test_quiet_model_logs(hunitest.TestCase):
+    """
+    Test `kats_utils.quiet_model_logs()`.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the Stan logger is silenced inside and restored after.
+        """
+        # Prepare inputs.
+        logger = logging.getLogger("cmdstanpy")
+        previous = logger.level
+        logger.setLevel(logging.INFO)
+        # Prepare outputs.
+        expected = (logging.ERROR, logging.INFO)
+        # Run test.
+        with utils.quiet_model_logs():
+            inside = logger.level
+        after = logger.level
+        logger.setLevel(previous)
+        # Check outputs.
+        self.assertEqual((inside, after), expected)
 
 
 # #############################################################################
@@ -1194,6 +1310,36 @@ class Test_summarize_rolling_evaluation(hunitest.TestCase):
         self.assert_equal(
             actual.round(4).to_string(), expected, dedent=True, fuzzy_match=True
         )
+
+
+# #############################################################################
+# Test_plot_series
+# #############################################################################
+
+
+class Test_plot_series(hunitest.TestCase):
+    """
+    Test `kats_utils.plot_series()`.
+    """
+
+    def test1(self) -> None:
+        """
+        Test that the plot has one panel with the given title.
+        """
+        # Prepare inputs.
+        plt = utils.plt
+        plt.switch_backend("Agg")
+        series = utils.make_synthetic_series(num_periods=30)
+        title = "Toy series"
+        # Prepare outputs.
+        expected = (1, title)
+        # Run test.
+        utils.plot_series(series, title=title)
+        # Check outputs.
+        axes = plt.gcf().axes
+        actual = (len(axes), axes[0].get_title())
+        plt.close("all")
+        self.assertEqual(actual, expected)
 
 
 # #############################################################################
